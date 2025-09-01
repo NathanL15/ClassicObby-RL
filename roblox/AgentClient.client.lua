@@ -6,7 +6,7 @@
 
 -- ========= CONFIG =========
 local STEP_DT       = 0.05            -- Internal control/update interval (reward shaping, local sim)
-local ACTION_DECISION_DT = 0.15       -- Server (HTTP) decision interval (reduce to avoid rate limits)
+local ACTION_DECISION_DT = 0.10       -- Faster decisions (still rate-limit friendly)
 local CHECK_RADIUS  = 6               -- forgiving early on
 local FALL_Y        = -20
 local DOWN_RAY      = 50
@@ -102,6 +102,7 @@ local HAS_CP0 = (CHECKPOINT_FOLDER:FindFirstChild("CP_0") ~= nil)
 local INITIAL_CP_INDEX = HAS_CP0 and 0 or 1
 local nextCP = INITIAL_CP_INDEX
 local lastDist = math.huge
+local lastPotential = 0            -- -lastDist after first distance measurement
 local died = false
 local stepCounter = 0
 local episodeCounter = 1
@@ -109,6 +110,7 @@ local lastObs = nil
 local currentAction = 0               -- cached action applied every frame for smooth motion
 local bestDistThisCP = math.huge      -- best (smallest) distance observed since current checkpoint became target
 local noProgressSteps = 0             -- counter for stagnation
+local milestoneDist = math.huge       -- last distance threshold that yielded milestone reward
 local timeSinceJump = 0
 local wasGrounded = true
 
@@ -122,6 +124,8 @@ local function actionToMove(action)
 		return hrp.CFrame.RightVector
 	elseif action == 5 then
 		return hrp.CFrame.LookVector -- move forward + jump
+	elseif action == 6 then
+		return -hrp.CFrame.LookVector -- backward
 	end
 	return Vector3.zero
 end
@@ -245,7 +249,9 @@ else
 end
 lastObs = getObs()
 lastDist = distanceToCP()
+lastPotential = -lastDist
 log("Initial nextCP=%d  dist=%.2f", nextCP, lastDist)
+local GAMMA = 0.99  -- discount for potential-based shaping
 
 -- ----- main loop -----
 local accum = 0
@@ -270,75 +276,24 @@ RunService.Heartbeat:Connect(function(dt)
 	accum = 0
 	stepCounter += 1
 
-	-- reward shaping (instantaneous)
-	local reward = -0.01
+	-- Progress reward (difference in distance)
 	local dNow = distanceToCP()
-	local shaped = 0
-	local backtrackPenalty = 0
-	local headingShape = 0
-	local horizShape = 0
-	local jumpBonus = 0
-	local idlePenalty = 0
-
-	-- forward progress shaping (positive)
-	if dNow < lastDist then
-		shaped = (lastDist - dNow) * 0.1
-		reward += shaped
+	local improvement = lastDist - dNow              -- >0 means closer
+	local shaped = improvement
+	if shaped < -2 then shaped = -2 end             -- cap regress penalty
+	-- Significant single-step leap bonus
+	local leapBonus = (improvement >= 2) and 1 or 0
+	-- Milestone reward: every time bestDist improves by >=1 stud beyond previous milestone
+	local milestoneBonus = 0
+	if dNow + 1 < milestoneDist then
+		milestoneBonus = 2
+		milestoneDist = dNow
 	end
+	local reward = -0.005 + 1.5 * shaped + leapBonus + milestoneBonus
+	lastPotential = -dNow
+	lastDist = dNow
 
-	-- horizontal progress shaping (ignore vertical so climbing not penalized)
-	local posCP = getCPPos(nextCP)
-	if posCP then
-		local toCP = posCP - hrp.Position
-		local horizDist = Vector3.new(toCP.X, 0, toCP.Z).Magnitude
-		local lastToCP = lastDist -- lastDist includes vertical; approximate horiz improvement using shaped when mostly horizontal
-		-- Use previous and current horizontal via storing bestDistThisCP if needed (simpler: reward alignment * speed)
-		local look = hrp.CFrame.LookVector
-		horizShape = look:Dot(Vector3.new(toCP.X,0,toCP.Z).Unit) * (Vector3.new(hrp.AssemblyLinearVelocity.X,0,hrp.AssemblyLinearVelocity.Z).Magnitude) * 0.001 * HORIZ_PROGRESS_SCALE
-		if horizShape > 0 then
-			reward += horizShape
-		end
-	end
-
-	-- backtrack penalty if moving away enough
-	if dNow - lastDist > BACKTRACK_THRESH then
-		backtrackPenalty = (dNow - lastDist) * BACKTRACK_PENALTY_SCALE
-		reward -= backtrackPenalty
-	end
-
-	-- heading alignment shaping (encourage facing goal while moving)
-	if HEADING_SHAPE_SCALE > 0 then
-		local cpPos = getCPPos(nextCP)
-		if cpPos then
-			local dir = (cpPos - hrp.Position)
-			if dir.Magnitude > 0.001 then
-				local look = hrp.CFrame.LookVector
-				headingShape = math.clamp(look:Dot(dir.Unit), -1, 1) * HEADING_SHAPE_SCALE
-				reward += headingShape
-			end
-		end
-	end
-
-	-- jump encouragement: reward upward velocity right after leaving ground while moving toward target
-	local vNow = hrp.AssemblyLinearVelocity
-	local upward = vNow.Y > 2
-	local currentGroundDist = rayDist(hrp.Position, Vector3.new(0,-1,0), DOWN_RAY)
-	local currentGrounded = currentGroundDist < 5
-	if (not currentGrounded) and wasGrounded and upward then
-		jumpBonus = JUMP_UP_BONUS * math.clamp(headingShape*500, -1, 1)
-		reward += jumpBonus
-		timeSinceJump = 0
-	end
-	wasGrounded = currentGrounded
-
-	-- idle penalty
-	local speedH = Vector3.new(hrp.AssemblyLinearVelocity.X,0,hrp.AssemblyLinearVelocity.Z).Magnitude
-	if speedH < IDLE_SPEED_THRESH then
-		idlePenalty = IDLE_PENALTY
-		reward -= idlePenalty
-	end
-
-	-- stagnation tracking
+	-- Basic stagnation tracking retained (optional soft reset)
 	if dNow + MIN_PROGRESS_EPS < bestDistThisCP then
 		bestDistThisCP = dNow
 		noProgressSteps = 0
@@ -347,13 +302,10 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	local forcedStuck = false
 	if noProgressSteps >= STUCK_STEPS then
-		-- treat as episode end due to being stuck (soft reset)
 		reward -= STUCK_PENALTY
 		forcedStuck = true
 		noProgressSteps = 0
 	end
-
-	lastDist = dNow
 
 	local reached = false
 	if atCheckpoint() then
@@ -362,25 +314,24 @@ RunService.Heartbeat:Connect(function(dt)
 		nextCP += 1
 		reached = true
 		hrp.AssemblyLinearVelocity = Vector3.zero
-		-- reset progress trackers for new checkpoint target
 		bestDistThisCP = math.huge
 		noProgressSteps = 0
 	end
 
 	local done = resetIfDeadOrFall()
 	if forcedStuck and not done then
-		-- manually reset (without death/fall) to encourage exploration
 		resetTo(nextCP - 1)
 		done = true
 		episodeCounter += 1
 		lastDist = distanceToCP()
+		lastPotential = -lastDist
 		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d", episodeCounter, STUCK_PENALTY, lastDist, nextCP)
 	elseif done then
 		reward -= 10
 		episodeCounter += 1
 		lastDist = distanceToCP()
+		lastPotential = -lastDist
 		log("Episode %d reset  (-10). New dist=%.2f  nextCP=%d", episodeCounter, lastDist, nextCP)
-		-- reset progress trackers after respawn
 		bestDistThisCP = math.huge
 		noProgressSteps = 0
 	end
@@ -390,17 +341,18 @@ RunService.Heartbeat:Connect(function(dt)
 	actionAccum += STEP_DT
 
 	if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
-        log("step=%d ep=%d nextCP=%d pos=%s dist=%.2f instR=%.3f batchR=%.3f (prog=%.3f horiz=%.4f back=%.3f head=%.4f jump=%.3f idle=%.3f stuckSteps=%d chk=%s done=%s)",
-            stepCounter, episodeCounter, nextCP, v3(hrp.Position), dNow, reward,
-            pendingReward, shaped, horizShape, backtrackPenalty, headingShape, jumpBonus, idlePenalty,
-            noProgressSteps, tostring(reached), tostring(done))
+		log("step=%d ep=%d nextCP=%d dist=%.2f r=%.3f shaped=%.3f leap=%d milestone=%d batch=%.3f best=%.2f stuckSteps=%d chk=%s done=%s",
+			stepCounter, episodeCounter, nextCP, dNow, reward, shaped, leapBonus, milestoneBonus,
+			pendingReward, bestDistThisCP, noProgressSteps, tostring(reached), tostring(done))
 	end
 
 	-- Decide whether to call server now (time or episode end)
 	if actionAccum >= ACTION_DECISION_DT or done then
+		-- Prepare fresh observation BEFORE querying server so state aligns with accumulated reward
+		local newObs = getObs()
 		-- ==== ask server (which calls Python) for action (batched reward) ====
 		local action = 0
-		local payload = { obs = lastObs, reward = pendingReward, done = done }
+		local payload = { obs = newObs, reward = pendingReward, done = done }
 		local ok, result = pcall(function()
 			return RLStep:InvokeServer(payload)   -- returns an action integer
 		end)
@@ -412,17 +364,21 @@ RunService.Heartbeat:Connect(function(dt)
 		end
 		-- ====================================================
 
-		-- cache action; jump immediate (one-shot). Movement handled per-frame.
+		-- cache action with jump mask (disallow jump while airborne)
+		local groundedNow = (rayDist(hrp.Position, Vector3.new(0,-1,0), DOWN_RAY) < 5)
+		if (action == 4 or action == 5) and not groundedNow then
+			action = 1  -- fallback to forward move if jump attempted in air
+		end
 		currentAction = action
-		if action == 4 or action == 5 then
+		if groundedNow and (action == 4 or action == 5) then
 			hum.Jump = true
 			if action == 5 then
 				applyForwardJumpBoost()
 			end
 		end
 
-		-- refresh obs after decision
-		lastObs = getObs()
+		-- commit new observation for next step
+		lastObs = newObs
 		pendingReward = 0
 		actionAccum = 0
 	end
