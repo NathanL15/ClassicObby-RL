@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+# Models / checkpoints (use LFS if you want)
+*.pt
+*.pth
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Roblox backups
+*.rbxm
+*.rbxmx
