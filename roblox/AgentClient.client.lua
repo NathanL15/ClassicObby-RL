@@ -31,6 +31,11 @@ local FORWARD_JUMP_SPEED = 38         -- target horizontal speed when initiating
 local JUMP_FORWARD_IMPULSE = 55       -- impulse strength for forward jump (scaled by mass)
 local FACE_TARGET_DURING_AIR = false  -- keep facing next checkpoint while airborne to reduce spin (set true to force)
 local AIR_STEER_KEEP_VEL = true       -- reserved flag for future in-air steering tweaks
+-- Hazard config
+local HAZARD_TAG = "Hazard"          -- CollectionService tag for deadly blocks
+local HAZARD_NEAR_RADIUS = 15         -- start avoidance shaping within this radius
+local HAZARD_AVOID_PENALTY = 0.02     -- per step penalty when moving toward nearby hazard
+local SAFE_PROGRESS_IMPROVE = 0.25    -- improvement threshold to log safe platform
 -- Optional distinct starting spawn part (e.g. a Part or SpawnLocation) named START_SPAWN_NAME.
 local START_SPAWN_NAME = "StartSpawn"
 local function getStartSpawn()
@@ -42,6 +47,7 @@ end
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 
 -- RemoteFunction provided by server (server makes the HTTP request)
 local RLStep = ReplicatedStorage:WaitForChild("RLStep")
@@ -111,6 +117,9 @@ local currentAction = 0               -- cached action applied every frame for s
 local bestDistThisCP = math.huge      -- best (smallest) distance observed since current checkpoint became target
 local noProgressSteps = 0             -- counter for stagnation
 local milestoneDist = math.huge       -- last distance threshold that yielded milestone reward
+local lastDeathType = 0               -- 0 none,1 hazard,2 fall,3 other
+local hazardTouchTime = -1
+local safePlatformCFrame = nil
 local timeSinceJump = 0
 local wasGrounded = true
 
@@ -154,8 +163,40 @@ end
 
 hum.Died:Connect(function()
 	died = true
-	log("Humanoid.Died fired")
+	if os.clock() - hazardTouchTime < 1.0 then
+		lastDeathType = 1
+	elseif lastDeathType == 0 then
+		lastDeathType = 3
+	end
+	log("Humanoid.Died fired type=%d", lastDeathType)
 end)
+
+-- Hazard helpers
+local function getNearestHazard()
+	local hazards = CollectionService:GetTagged(HAZARD_TAG)
+	local nearest, dist = nil, math.huge
+	for _,h in ipairs(hazards) do
+		if h:IsA("BasePart") then
+			local d = (h.Position - hrp.Position).Magnitude
+			if d < dist then
+				dist = d; nearest = h
+			end
+		end
+	end
+	return nearest, dist
+end
+
+local function connectHazardTouch(obj)
+	if obj:IsA("BasePart") then
+		obj.Touched:Connect(function(hit)
+			if CollectionService:HasTag(hit, HAZARD_TAG) then
+				hazardTouchTime = os.clock()
+			end
+		end)
+	end
+end
+for _,d in ipairs(char:GetDescendants()) do connectHazardTouch(d) end
+char.DescendantAdded:Connect(connectHazardTouch)
 
 -- Baseline movement tuning
 hum.WalkSpeed = BASE_WALK_SPEED
@@ -212,6 +253,9 @@ local function getObs()
 	local dropF = rayDist(posF, Vector3.new(0,-1,0), DOWN_RAY)
 	local dropR = rayDist(posR, Vector3.new(0,-1,0), DOWN_RAY)
 	local dropL = rayDist(posL, Vector3.new(0,-1,0), DOWN_RAY)
+	local nearestHazard, hazardDist = getNearestHazard()
+	if hazardDist == math.huge then hazardDist = FWD_RAY end
+	local hazardDistNorm = math.clamp(hazardDist / FWD_RAY, 0, 1)
 	return {
 		dx = dx, dy = dy, dz = dz,
 		vx = v.X, vy = v.Y, vz = v.Z,
@@ -225,6 +269,9 @@ local function getObs()
 		r4 = radial[5], r5 = radial[6], r6 = radial[7], r7 = radial[8],
 		-- edge downward probes
 		dropF = dropF, dropR = dropR, dropL = dropL,
+		-- hazard features
+		hazardDist = hazardDistNorm,
+		lastDeathType = lastDeathType,
 	}
 end
 
@@ -258,9 +305,16 @@ end
 
 
 local function resetIfDeadOrFall()
+	if hrp.Position.Y < FALL_Y then lastDeathType = 2 end
 	if died or hrp.Position.Y < FALL_Y then
+		if lastDeathType == 1 and safePlatformCFrame then
+			hrP = hrp; hrP.CFrame = safePlatformCFrame + Vector3.new(0,5,0)
+			hrP.AssemblyLinearVelocity = Vector3.zero
+			hum:ChangeState(Enum.HumanoidStateType.Landed)
+		else
+			resetTo(nextCP - 1)
+		end
 		died = false
-		resetTo(nextCP - 1)  -- this will use StartSpawn until CP_1 is reached
 		return true
 	end
 	return false
@@ -323,6 +377,9 @@ RunService.Heartbeat:Connect(function(dt)
 	if dNow + MIN_PROGRESS_EPS < bestDistThisCP then
 		bestDistThisCP = dNow
 		noProgressSteps = 0
+		if wasGrounded and improvement > SAFE_PROGRESS_IMPROVE then
+			safePlatformCFrame = hrp.CFrame
+		end
 	else
 		noProgressSteps += 1
 	end
@@ -351,25 +408,39 @@ RunService.Heartbeat:Connect(function(dt)
 		episodeCounter += 1
 		lastDist = distanceToCP()
 		lastPotential = -lastDist
-		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d", episodeCounter, STUCK_PENALTY, lastDist, nextCP)
+		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d dt=%d", episodeCounter, STUCK_PENALTY, lastDist, nextCP, lastDeathType)
 	elseif done then
 		reward -= 10
 		episodeCounter += 1
 		lastDist = distanceToCP()
 		lastPotential = -lastDist
-		log("Episode %d reset  (-10). New dist=%.2f  nextCP=%d", episodeCounter, lastDist, nextCP)
+		log("Episode %d reset  (-10). New dist=%.2f  nextCP=%d dt=%d", episodeCounter, lastDist, nextCP, lastDeathType)
 		bestDistThisCP = math.huge
 		noProgressSteps = 0
 	end
 
-	-- accumulate reward for batching
+	-- Hazard avoidance shaping
+	local hPart, hDist = getNearestHazard()
+	if hPart and hDist < HAZARD_NEAR_RADIUS then
+		local vel = hrp.AssemblyLinearVelocity
+		local velH = Vector3.new(vel.X,0,vel.Z)
+		if velH.Magnitude > 1 then
+			local toHaz = Vector3.new(hPart.Position.X - hrp.Position.X, 0, hPart.Position.Z - hrp.Position.Z)
+			if toHaz.Magnitude > 0 then
+				local toward = velH.Unit:Dot(toHaz.Unit)
+				if toward > 0.5 then
+					reward -= HAZARD_AVOID_PENALTY
+				end
+			end
+		end
+	end
 	pendingReward += reward
 	actionAccum += STEP_DT
 
 	if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
-		log("step=%d ep=%d nextCP=%d dist=%.2f r=%.3f shaped=%.3f leap=%d milestone=%d batch=%.3f best=%.2f stuckSteps=%d chk=%s done=%s",
+		log("step=%d ep=%d nextCP=%d dist=%.2f r=%.3f shaped=%.3f leap=%d milestone=%d batch=%.3f best=%.2f stuckSteps=%d chk=%s done=%s dt=%d",
 			stepCounter, episodeCounter, nextCP, dNow, reward, shaped, leapBonus, milestoneBonus,
-			pendingReward, bestDistThisCP, noProgressSteps, tostring(reached), tostring(done))
+			pendingReward, bestDistThisCP, noProgressSteps, tostring(reached), tostring(done), lastDeathType)
 	end
 
 	-- Decide whether to call server now (time or episode end)
@@ -405,6 +476,7 @@ RunService.Heartbeat:Connect(function(dt)
 
 		-- commit new observation for next step
 		lastObs = newObs
+		lastDeathType = 0 -- consume after reporting
 		pendingReward = 0
 		actionAccum = 0
 	end
