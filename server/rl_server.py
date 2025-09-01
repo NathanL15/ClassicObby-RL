@@ -41,6 +41,27 @@ bsz = 64
 update_every = 4
 tgt_sync_every = 1000
 step_count = 0
+current_ep_return = 0.0
+best_return = -1e9
+
+import os, time
+
+SAVE_DIR = "checkpoints"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+def save_checkpoint(name: str, is_best=False):
+    path = os.path.join(SAVE_DIR, name)
+    torch.save({
+        'q': q.state_dict(),
+        'q_tgt': q_tgt.state_dict(),
+        'eps': eps,
+        'step_count': step_count,
+        'best_return': best_return,
+        'obs_keys': OBS_KEYS,
+        'timestamp': time.time(),
+        'is_best': is_best,
+    }, path)
+
 
 last_obs = None
 last_action = None
@@ -74,11 +95,12 @@ def train_step():
 
 @app.route("/step", methods=["POST"])
 def step():
-    global last_obs, last_action, eps, step_count
+    global last_obs, last_action, eps, step_count, current_ep_return, best_return
     data = request.get_json(force=True)
     obs = to_vec(data["obs"])
     reward = float(data.get("reward", 0.0))
     done = bool(data.get("done", False))
+    current_ep_return += reward
 
     if last_obs is not None and last_action is not None:
         buf.append((last_obs, last_action, reward, obs, 1.0 if done else 0.0))
@@ -90,8 +112,20 @@ def step():
 
     action = select_action(obs)
 
-    last_obs = None if done else obs
-    last_action = None if done else action
+    if done:
+        # episode finished: save latest checkpoint
+        save_checkpoint("last.pt", is_best=False)
+        # update best
+        if current_ep_return > best_return:
+            best_return = current_ep_return
+            save_checkpoint("best.pt", is_best=True)
+        # reset episode accumulator
+        current_ep_return = 0.0
+        last_obs = None
+        last_action = None
+    else:
+        last_obs = obs
+        last_action = action
     step_count += 1
 
     return jsonify({"action": action})
