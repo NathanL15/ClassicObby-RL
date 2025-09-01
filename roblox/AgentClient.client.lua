@@ -5,7 +5,8 @@
 --   � ServerScriptService/RLServer.lua (from previous message)
 
 -- ========= CONFIG =========
-local STEP_DT       = 0.10            -- RL decision interval (seconds). Movement now applied every frame.
+local STEP_DT       = 0.05            -- Internal control/update interval (reward shaping, local sim)
+local ACTION_DECISION_DT = 0.15       -- Server (HTTP) decision interval (reduce to avoid rate limits)
 local CHECK_RADIUS  = 6               -- forgiving early on
 local FALL_Y        = -20
 local DOWN_RAY      = 50
@@ -20,6 +21,11 @@ local STUCK_STEPS = 120               -- RL steps without sufficient improvement
 local MIN_PROGRESS_EPS = 0.5          -- need at least this much dist improvement to count as progress
 local STUCK_PENALTY = 8               -- penalty when flagged stuck (separate from normal -10 death)
 local HEADING_SHAPE_SCALE = 0.002     -- reward scale for looking toward target (0 to disable)
+local HORIZ_PROGRESS_SCALE = 0.08     -- additional reward for horizontal (XZ) approach
+local JUMP_UP_BONUS = 0.5             -- bonus when upward velocity during approach & leaving ground
+local IDLE_SPEED_THRESH = 1.0         -- below this horizontal speed counts as idle
+local IDLE_PENALTY = 0.02             -- per step penalty while idle
+local MAX_TIME_SINCE_JUMP = 5.0       -- cap for observation normalization
 -- Optional distinct starting spawn part (e.g. a Part or SpawnLocation) named START_SPAWN_NAME.
 local START_SPAWN_NAME = "StartSpawn"
 local function getStartSpawn()
@@ -98,6 +104,8 @@ local lastObs = nil
 local currentAction = 0               -- cached action applied every frame for smooth motion
 local bestDistThisCP = math.huge      -- best (smallest) distance observed since current checkpoint became target
 local noProgressSteps = 0             -- counter for stagnation
+local timeSinceJump = 0
+local wasGrounded = true
 
 -- Convert action id -> desired move vector (world space forward/right relative to HRP)
 local function actionToMove(action)
@@ -140,10 +148,22 @@ local function getObs()
 	local v = hrp.AssemblyLinearVelocity
 	local down = rayDist(hrp.Position, Vector3.new(0, -1, 0), DOWN_RAY)
 	local forward = rayDist(hrp.Position, hrp.CFrame.LookVector, FWD_RAY)
+	local grounded = (down < 5) and 1 or 0
+	local cpDir = Vector3.new(dx, dy, dz)
+	local look = hrp.CFrame.LookVector
+	local angleCos = 0
+	if cpDir.Magnitude > 0.001 then
+		angleCos = look:Dot(cpDir.Unit)
+	end
+	local speedH = Vector3.new(v.X, 0, v.Z).Magnitude
 	return {
 		dx = dx, dy = dy, dz = dz,
 		vx = v.X, vy = v.Y, vz = v.Z,
-		down = down, forward = forward
+		down = down, forward = forward,
+		angle = angleCos,
+		grounded = grounded,
+		speed = speedH,
+		tJump = math.min(timeSinceJump, MAX_TIME_SINCE_JUMP)
 	}
 end
 
@@ -198,6 +218,8 @@ log("Initial nextCP=%d  dist=%.2f", nextCP, lastDist)
 
 -- ----- main loop -----
 local accum = 0
+local actionAccum = 0                 -- accumulates time until next server decision
+local pendingReward = 0              -- batched reward since last decision
 -- High-frequency loop: apply last decided action every frame for smoothness
 RunService.RenderStepped:Connect(function()
 	-- apply cached movement continuously (Roblox internally blends)
@@ -207,22 +229,40 @@ end)
 
 -- Lower-frequency loop: query RL server & update action
 RunService.Heartbeat:Connect(function(dt)
+	timeSinceJump += dt
 	accum += dt
 	if accum < STEP_DT then return end
 	accum = 0
 	stepCounter += 1
 
-	-- reward shaping
+	-- reward shaping (instantaneous)
 	local reward = -0.01
 	local dNow = distanceToCP()
 	local shaped = 0
 	local backtrackPenalty = 0
 	local headingShape = 0
+	local horizShape = 0
+	local jumpBonus = 0
+	local idlePenalty = 0
 
 	-- forward progress shaping (positive)
 	if dNow < lastDist then
 		shaped = (lastDist - dNow) * 0.1
 		reward += shaped
+	end
+
+	-- horizontal progress shaping (ignore vertical so climbing not penalized)
+	local posCP = getCPPos(nextCP)
+	if posCP then
+		local toCP = posCP - hrp.Position
+		local horizDist = Vector3.new(toCP.X, 0, toCP.Z).Magnitude
+		local lastToCP = lastDist -- lastDist includes vertical; approximate horiz improvement using shaped when mostly horizontal
+		-- Use previous and current horizontal via storing bestDistThisCP if needed (simpler: reward alignment * speed)
+		local look = hrp.CFrame.LookVector
+		horizShape = look:Dot(Vector3.new(toCP.X,0,toCP.Z).Unit) * (Vector3.new(hrp.AssemblyLinearVelocity.X,0,hrp.AssemblyLinearVelocity.Z).Magnitude) * 0.001 * HORIZ_PROGRESS_SCALE
+		if horizShape > 0 then
+			reward += horizShape
+		end
 	end
 
 	-- backtrack penalty if moving away enough
@@ -242,6 +282,25 @@ RunService.Heartbeat:Connect(function(dt)
 				reward += headingShape
 			end
 		end
+	end
+
+	-- jump encouragement: reward upward velocity right after leaving ground while moving toward target
+	local vNow = hrp.AssemblyLinearVelocity
+	local upward = vNow.Y > 2
+	local currentGroundDist = rayDist(hrp.Position, Vector3.new(0,-1,0), DOWN_RAY)
+	local currentGrounded = currentGroundDist < 5
+	if (not currentGrounded) and wasGrounded and upward then
+		jumpBonus = JUMP_UP_BONUS * math.clamp(headingShape*500, -1, 1)
+		reward += jumpBonus
+		timeSinceJump = 0
+	end
+	wasGrounded = currentGrounded
+
+	-- idle penalty
+	local speedH = Vector3.new(hrp.AssemblyLinearVelocity.X,0,hrp.AssemblyLinearVelocity.Z).Magnitude
+	if speedH < IDLE_SPEED_THRESH then
+		idlePenalty = IDLE_PENALTY
+		reward -= idlePenalty
 	end
 
 	-- stagnation tracking
@@ -291,33 +350,42 @@ RunService.Heartbeat:Connect(function(dt)
 		noProgressSteps = 0
 	end
 
+	-- accumulate reward for batching
+	pendingReward += reward
+	actionAccum += STEP_DT
+
 	if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
-		log("step=%d ep=%d nextCP=%d pos=%s dist=%.2f r=%.3f (prog=%.3f back=%.3f head=%.4f stuckSteps=%d chk=%s done=%s)",
-			stepCounter, episodeCounter, nextCP, v3(hrp.Position), dNow, reward,
-			shaped, backtrackPenalty, headingShape, noProgressSteps,
-			tostring(reached), tostring(done))
+        log("step=%d ep=%d nextCP=%d pos=%s dist=%.2f instR=%.3f batchR=%.3f (prog=%.3f horiz=%.4f back=%.3f head=%.4f jump=%.3f idle=%.3f stuckSteps=%d chk=%s done=%s)",
+            stepCounter, episodeCounter, nextCP, v3(hrp.Position), dNow, reward,
+            pendingReward, shaped, horizShape, backtrackPenalty, headingShape, jumpBonus, idlePenalty,
+            noProgressSteps, tostring(reached), tostring(done))
 	end
 
-	-- ==== ask server (which calls Python) for action ====
-	local action = 0
-	local payload = { obs = lastObs, reward = reward, done = done }
-	local ok, result = pcall(function()
-		return RLStep:InvokeServer(payload)   -- returns an action integer
-	end)
-	if ok then
-		action = tonumber(result) or 0
-	else
-		warnf("RLStep InvokeServer failed: %s", tostring(result))
-		action = 0
-	end
-	-- ====================================================
+	-- Decide whether to call server now (time or episode end)
+	if actionAccum >= ACTION_DECISION_DT or done then
+		-- ==== ask server (which calls Python) for action (batched reward) ====
+		local action = 0
+		local payload = { obs = lastObs, reward = pendingReward, done = done }
+		local ok, result = pcall(function()
+			return RLStep:InvokeServer(payload)   -- returns an action integer
+		end)
+		if ok then
+			action = tonumber(result) or 0
+		else
+			warnf("RLStep InvokeServer failed: %s", tostring(result))
+			action = 0
+		end
+		-- ====================================================
 
-	-- cache action; jump immediate (one-shot). Movement handled per-frame.
-	currentAction = action
-	if action == 4 or action == 5 then
-		hum.Jump = true
-	end
+		-- cache action; jump immediate (one-shot). Movement handled per-frame.
+		currentAction = action
+		if action == 4 or action == 5 then
+			hum.Jump = true
+		end
 
-	-- refresh obs for next step
-	lastObs = getObs()
+		-- refresh obs after decision
+		lastObs = getObs()
+		pendingReward = 0
+		actionAccum = 0
+	end
 end)
