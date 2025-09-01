@@ -7,7 +7,11 @@ from collections import deque
 
 app = Flask(__name__)
 
-OBS_KEYS = ["dx","dy","dz","vx","vy","vz","down","forward","angle","grounded","speed","tJump"]
+OBS_KEYS = [
+    "dx","dy","dz","vx","vy","vz","down","forward","angle","grounded","speed","tJump",
+    "r0","r1","r2","r3","r4","r5","r6","r7",
+    "dropF","dropR","dropL"
+]
 N_OBS, N_ACT = len(OBS_KEYS), 7  # added backward action (6)
 
 device = torch.device("cpu")

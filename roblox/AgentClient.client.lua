@@ -191,6 +191,27 @@ local function getObs()
 		angleCos = look:Dot(cpDir.Unit)
 	end
 	local speedH = Vector3.new(v.X, 0, v.Z).Magnitude
+
+	-- Radial horizontal rays (8 directions around agent) for local obstacle / gap sensing
+	local radial = {}
+	local f = hrp.CFrame.LookVector
+	local r = hrp.CFrame.RightVector
+	for i = 0,7 do
+		local ang = (math.pi * 2) * (i / 8)
+		local dir = (f * math.cos(ang) + r * math.sin(ang))
+		dir = Vector3.new(dir.X, 0, dir.Z).Unit
+		radial[i+1] = rayDist(hrp.Position, dir, FWD_RAY)
+	end
+
+	-- Edge downward probes (forward / left / right) a few studs out to detect upcoming gaps
+	local EDGE_OFFSET = 3
+	local posBase = hrp.Position
+	local posF = posBase + f * EDGE_OFFSET
+	local posR = posBase + r * EDGE_OFFSET
+	local posL = posBase - r * EDGE_OFFSET
+	local dropF = rayDist(posF, Vector3.new(0,-1,0), DOWN_RAY)
+	local dropR = rayDist(posR, Vector3.new(0,-1,0), DOWN_RAY)
+	local dropL = rayDist(posL, Vector3.new(0,-1,0), DOWN_RAY)
 	return {
 		dx = dx, dy = dy, dz = dz,
 		vx = v.X, vy = v.Y, vz = v.Z,
@@ -198,7 +219,12 @@ local function getObs()
 		angle = angleCos,
 		grounded = grounded,
 		speed = speedH,
-		tJump = math.min(timeSinceJump, MAX_TIME_SINCE_JUMP)
+		tJump = math.min(timeSinceJump, MAX_TIME_SINCE_JUMP),
+		-- radial distances
+		r0 = radial[1], r1 = radial[2], r2 = radial[3], r3 = radial[4],
+		r4 = radial[5], r5 = radial[6], r6 = radial[7], r7 = radial[8],
+		-- edge downward probes
+		dropF = dropF, dropR = dropR, dropL = dropL,
 	}
 end
 
