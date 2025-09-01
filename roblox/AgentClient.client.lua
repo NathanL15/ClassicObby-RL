@@ -13,6 +13,13 @@ local FWD_RAY       = 50
 local VERBOSE       = true            -- master switch
 local LOG_EVERY     = 10              -- steps
 -- ==========================
+-- Progress shaping / anti-loop config
+local BACKTRACK_THRESH = 1.0          -- studs increase in distance considered a backtrack
+local BACKTRACK_PENALTY_SCALE = 0.05  -- penalty per stud of backtrack beyond threshold
+local STUCK_STEPS = 120               -- RL steps without sufficient improvement => stuck reset
+local MIN_PROGRESS_EPS = 0.5          -- need at least this much dist improvement to count as progress
+local STUCK_PENALTY = 8               -- penalty when flagged stuck (separate from normal -10 death)
+local HEADING_SHAPE_SCALE = 0.002     -- reward scale for looking toward target (0 to disable)
 -- Optional distinct starting spawn part (e.g. a Part or SpawnLocation) named START_SPAWN_NAME.
 local START_SPAWN_NAME = "StartSpawn"
 local function getStartSpawn()
@@ -79,13 +86,18 @@ local function rayDist(origin, dir, len)
 end
 
 -- ----- obs/reward helpers -----
-local nextCP = 1
+-- Allow an optional CP_0 (acts as first learning target). If absent we start at CP_1.
+local HAS_CP0 = (CHECKPOINT_FOLDER:FindFirstChild("CP_0") ~= nil)
+local INITIAL_CP_INDEX = HAS_CP0 and 0 or 1
+local nextCP = INITIAL_CP_INDEX
 local lastDist = math.huge
 local died = false
 local stepCounter = 0
 local episodeCounter = 1
 local lastObs = nil
 local currentAction = 0               -- cached action applied every frame for smooth motion
+local bestDistThisCP = math.huge      -- best (smallest) distance observed since current checkpoint became target
+local noProgressSteps = 0             -- counter for stagnation
 
 -- Convert action id -> desired move vector (world space forward/right relative to HRP)
 local function actionToMove(action)
@@ -136,8 +148,8 @@ local function getObs()
 end
 
 local function resetTo(cpIndex)
-	-- Always prefer explicit start spawn if we haven't reached any checkpoint yet
-	if cpIndex < 1 then
+	-- Always prefer explicit start spawn if we haven't reached the first active checkpoint yet
+	if cpIndex < INITIAL_CP_INDEX then
 		local startPart = getStartSpawn()
 		if startPart and startPart:IsA("BasePart") then
 			hrp.CFrame = CFrame.new(startPart.Position + Vector3.new(0, 5, 0))
@@ -154,7 +166,7 @@ local function resetTo(cpIndex)
 	end
 
 	-- normal case: go to last reached checkpoint
-	local back = math.max(1, cpIndex)
+	local back = math.max(INITIAL_CP_INDEX, cpIndex)
 	local cp = CHECKPOINT_FOLDER:FindFirstChild("CP_" .. tostring(back))
 	if cp then
 		hrp.CFrame = CFrame.new(cp.Position + Vector3.new(0, 5, 0))
@@ -204,10 +216,49 @@ RunService.Heartbeat:Connect(function(dt)
 	local reward = -0.01
 	local dNow = distanceToCP()
 	local shaped = 0
+	local backtrackPenalty = 0
+	local headingShape = 0
+
+	-- forward progress shaping (positive)
 	if dNow < lastDist then
 		shaped = (lastDist - dNow) * 0.1
 		reward += shaped
 	end
+
+	-- backtrack penalty if moving away enough
+	if dNow - lastDist > BACKTRACK_THRESH then
+		backtrackPenalty = (dNow - lastDist) * BACKTRACK_PENALTY_SCALE
+		reward -= backtrackPenalty
+	end
+
+	-- heading alignment shaping (encourage facing goal while moving)
+	if HEADING_SHAPE_SCALE > 0 then
+		local cpPos = getCPPos(nextCP)
+		if cpPos then
+			local dir = (cpPos - hrp.Position)
+			if dir.Magnitude > 0.001 then
+				local look = hrp.CFrame.LookVector
+				headingShape = math.clamp(look:Dot(dir.Unit), -1, 1) * HEADING_SHAPE_SCALE
+				reward += headingShape
+			end
+		end
+	end
+
+	-- stagnation tracking
+	if dNow + MIN_PROGRESS_EPS < bestDistThisCP then
+		bestDistThisCP = dNow
+		noProgressSteps = 0
+	else
+		noProgressSteps += 1
+	end
+	local forcedStuck = false
+	if noProgressSteps >= STUCK_STEPS then
+		-- treat as episode end due to being stuck (soft reset)
+		reward -= STUCK_PENALTY
+		forcedStuck = true
+		noProgressSteps = 0
+	end
+
 	lastDist = dNow
 
 	local reached = false
@@ -217,21 +268,33 @@ RunService.Heartbeat:Connect(function(dt)
 		nextCP += 1
 		reached = true
 		hrp.AssemblyLinearVelocity = Vector3.zero
+		-- reset progress trackers for new checkpoint target
+		bestDistThisCP = math.huge
+		noProgressSteps = 0
 	end
 
 	local done = resetIfDeadOrFall()
-	if done then
+	if forcedStuck and not done then
+		-- manually reset (without death/fall) to encourage exploration
+		resetTo(nextCP - 1)
+		done = true
+		episodeCounter += 1
+		lastDist = distanceToCP()
+		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d", episodeCounter, STUCK_PENALTY, lastDist, nextCP)
+	elseif done then
 		reward -= 10
 		episodeCounter += 1
 		lastDist = distanceToCP()
-		log("Episode %d reset  (-10). New dist=%.2f  nextCP=%d",
-			episodeCounter, lastDist, nextCP)
+		log("Episode %d reset  (-10). New dist=%.2f  nextCP=%d", episodeCounter, lastDist, nextCP)
+		-- reset progress trackers after respawn
+		bestDistThisCP = math.huge
+		noProgressSteps = 0
 	end
 
 	if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
-		log("step=%d  ep=%d  nextCP=%d  pos=%s  v=%s  dist=%.2f  r=%.3f (shape=%.3f, chk=%s, done=%s)",
-			stepCounter, episodeCounter, nextCP, v3(hrp.Position),
-			v3(hrp.AssemblyLinearVelocity), dNow, reward, shaped,
+		log("step=%d ep=%d nextCP=%d pos=%s dist=%.2f r=%.3f (prog=%.3f back=%.3f head=%.4f stuckSteps=%d chk=%s done=%s)",
+			stepCounter, episodeCounter, nextCP, v3(hrp.Position), dNow, reward,
+			shaped, backtrackPenalty, headingShape, noProgressSteps,
 			tostring(reached), tostring(done))
 	end
 
