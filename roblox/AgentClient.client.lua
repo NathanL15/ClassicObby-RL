@@ -1,11 +1,11 @@
 -- AgentClient.client.lua (client-side, uses RemoteFunction RLStep)
 -- Expects:
---   • Workspace/Checkpoints/CP_1, CP_2, ...
---   • ReplicatedStorage/RemoteFunction RLStep  (server calls Python)
---   • ServerScriptService/RLServer.lua (from previous message)
+--   � Workspace/Checkpoints/CP_1, CP_2, ...
+--   � ReplicatedStorage/RemoteFunction RLStep  (server calls Python)
+--   � ServerScriptService/RLServer.lua (from previous message)
 
 -- ========= CONFIG =========
-local STEP_DT       = 0.10            -- control Hz ~10 (raise to 0.12 if jittery)
+local STEP_DT       = 0.10            -- RL decision interval (seconds). Movement now applied every frame.
 local CHECK_RADIUS  = 6               -- forgiving early on
 local FALL_Y        = -20
 local DOWN_RAY      = 50
@@ -13,6 +13,13 @@ local FWD_RAY       = 50
 local VERBOSE       = true            -- master switch
 local LOG_EVERY     = 10              -- steps
 -- ==========================
+-- Optional distinct starting spawn part (e.g. a Part or SpawnLocation) named START_SPAWN_NAME.
+local START_SPAWN_NAME = "StartSpawn"
+local function getStartSpawn()
+	-- deep search so it can live inside a Folder
+	return workspace:FindFirstChild(START_SPAWN_NAME, true)
+end
+
 
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
@@ -78,6 +85,21 @@ local died = false
 local stepCounter = 0
 local episodeCounter = 1
 local lastObs = nil
+local currentAction = 0               -- cached action applied every frame for smooth motion
+
+-- Convert action id -> desired move vector (world space forward/right relative to HRP)
+local function actionToMove(action)
+	if action == 1 then
+		return hrp.CFrame.LookVector
+	elseif action == 2 then
+		return -hrp.CFrame.RightVector
+	elseif action == 3 then
+		return hrp.CFrame.RightVector
+	elseif action == 5 then
+		return hrp.CFrame.LookVector -- move forward + jump
+	end
+	return Vector3.zero
+end
 
 hum.Died:Connect(function()
 	died = true
@@ -114,24 +136,38 @@ local function getObs()
 end
 
 local function resetTo(cpIndex)
+	-- Always prefer explicit start spawn if we haven't reached any checkpoint yet
+	if cpIndex < 1 then
+		local startPart = getStartSpawn()
+		if startPart and startPart:IsA("BasePart") then
+			hrp.CFrame = CFrame.new(startPart.Position + Vector3.new(0, 5, 0))
+		else
+			-- fallback: CP_1 if no start part exists
+			local cp1 = CHECKPOINT_FOLDER:FindFirstChild("CP_1")
+			if cp1 then
+				hrp.CFrame = CFrame.new(cp1.Position + Vector3.new(0, 5, 0))
+			end
+		end
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hum:ChangeState(Enum.HumanoidStateType.Landed)
+		return
+	end
+
+	-- normal case: go to last reached checkpoint
 	local back = math.max(1, cpIndex)
-	local cp = getCP(back)
+	local cp = CHECKPOINT_FOLDER:FindFirstChild("CP_" .. tostring(back))
 	if cp then
 		hrp.CFrame = CFrame.new(cp.Position + Vector3.new(0, 5, 0))
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hum:ChangeState(Enum.HumanoidStateType.Landed)
-		log("Teleport to CP_%d at %s", back, v3(cp.Position))
-	else
-		warnf("Missing CP_%d for respawn!", back)
 	end
 end
 
+
 local function resetIfDeadOrFall()
 	if died or hrp.Position.Y < FALL_Y then
-		local reason = died and "death" or "fall"
 		died = false
-		log("Reset due to %s (Y=%.2f)", reason, hrp.Position.Y)
-		resetTo(nextCP - 1)
+		resetTo(nextCP - 1)  -- this will use StartSpawn until CP_1 is reached
 		return true
 	end
 	return false
@@ -150,6 +186,14 @@ log("Initial nextCP=%d  dist=%.2f", nextCP, lastDist)
 
 -- ----- main loop -----
 local accum = 0
+-- High-frequency loop: apply last decided action every frame for smoothness
+RunService.RenderStepped:Connect(function()
+	-- apply cached movement continuously (Roblox internally blends)
+	local moveVec = actionToMove(currentAction)
+	hum:Move(moveVec, true)
+end)
+
+-- Lower-frequency loop: query RL server & update action
 RunService.Heartbeat:Connect(function(dt)
 	accum += dt
 	if accum < STEP_DT then return end
@@ -205,21 +249,11 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	-- ====================================================
 
-	-- apply action
-	local move = Vector3.zero
-	if action == 1 then
-		move = hrp.CFrame.LookVector
-	elseif action == 2 then
-		move = -hrp.CFrame.RightVector
-	elseif action == 3 then
-		move = hrp.CFrame.RightVector
-	elseif action == 4 then
+	-- cache action; jump immediate (one-shot). Movement handled per-frame.
+	currentAction = action
+	if action == 4 or action == 5 then
 		hum.Jump = true
-	elseif action == 5 then
-		hum.Jump = true
-		move = hrp.CFrame.LookVector
 	end
-	hum:Move(move, true)
 
 	-- refresh obs for next step
 	lastObs = getObs()
