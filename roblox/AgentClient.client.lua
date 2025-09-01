@@ -26,6 +26,11 @@ local JUMP_UP_BONUS = 0.5             -- bonus when upward velocity during appro
 local IDLE_SPEED_THRESH = 1.0         -- below this horizontal speed counts as idle
 local IDLE_PENALTY = 0.02             -- per step penalty while idle
 local MAX_TIME_SINCE_JUMP = 5.0       -- cap for observation normalization
+local BASE_WALK_SPEED = 16            -- baseline Humanoid WalkSpeed
+local FORWARD_JUMP_SPEED = 38         -- target horizontal speed when initiating a forward jump
+local JUMP_FORWARD_IMPULSE = 55       -- impulse strength for forward jump (scaled by mass)
+local FACE_TARGET_DURING_AIR = false  -- keep facing next checkpoint while airborne to reduce spin (set true to force)
+local AIR_STEER_KEEP_VEL = true       -- reserved flag for future in-air steering tweaks
 -- Optional distinct starting spawn part (e.g. a Part or SpawnLocation) named START_SPAWN_NAME.
 local START_SPAWN_NAME = "StartSpawn"
 local function getStartSpawn()
@@ -121,10 +126,36 @@ local function actionToMove(action)
 	return Vector3.zero
 end
 
+local function faceNextCheckpoint()
+	if not FACE_TARGET_DURING_AIR then return end
+	local cpPos = getCPPos(nextCP)
+	if not cpPos then return end
+	local pos = hrp.Position
+	local target = Vector3.new(cpPos.X, pos.Y, cpPos.Z)
+	local lookDir = target - pos
+	if lookDir.Magnitude < 0.001 then return end
+	hrp.CFrame = CFrame.new(pos, pos + lookDir.Unit)
+end
+
+local function applyForwardJumpBoost()
+	local mass = hrp.AssemblyMass
+	local forward = hrp.CFrame.LookVector
+	local vel = hrp.AssemblyLinearVelocity
+	local horiz = Vector3.new(vel.X, 0, vel.Z)
+	local desired = forward * FORWARD_JUMP_SPEED
+	local add = desired - horiz
+	local impulse = Vector3.new(add.X, 0, add.Z) * mass
+	hrp:ApplyImpulse(impulse)
+end
+
 hum.Died:Connect(function()
 	died = true
 	log("Humanoid.Died fired")
 end)
+
+-- Baseline movement tuning
+hum.WalkSpeed = BASE_WALK_SPEED
+hum.AutoRotate = true  -- allow natural rotation toward Move() direction
 
 local function distanceToCP()
 	local pos = getCPPos(nextCP)
@@ -225,6 +256,10 @@ RunService.RenderStepped:Connect(function()
 	-- apply cached movement continuously (Roblox internally blends)
 	local moveVec = actionToMove(currentAction)
 	hum:Move(moveVec, true)
+	-- Only force facing if explicitly enabled
+	if FACE_TARGET_DURING_AIR then
+		faceNextCheckpoint()
+	end
 end)
 
 -- Lower-frequency loop: query RL server & update action
@@ -381,6 +416,9 @@ RunService.Heartbeat:Connect(function(dt)
 		currentAction = action
 		if action == 4 or action == 5 then
 			hum.Jump = true
+			if action == 5 then
+				applyForwardJumpBoost()
+			end
 		end
 
 		-- refresh obs after decision
