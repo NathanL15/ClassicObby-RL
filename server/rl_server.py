@@ -33,14 +33,14 @@ q_tgt.load_state_dict(q.state_dict())
 opt = optim.Adam(q.parameters(), lr=1e-3)
 
 gamma = 0.99
-eps = 1.0
-eps_min = 0.05
+eps = 0.3  # Increased for more exploration on platforms
+eps_min = 0.2  # Temporarily increased for more exploration
 eps_decay = 0.9995
 buf = deque(maxlen=50000)
 elite_buf = deque(maxlen=5000)  # stores transitions from top episodes
-bsz = 64
-update_every = 4
-tgt_sync_every = 1000
+bsz = 128  # Increased from 64 for larger batches, faster training
+update_every = 2  # Reduced from 4 for more frequent updates
+tgt_sync_every = 500  # Reduced from 1000 for faster target network sync
 step_count = 0
 current_ep_return = 0.0
 best_return = -1e9
@@ -50,6 +50,19 @@ import os, time
 
 SAVE_DIR = "checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Load best model if exists
+best_path = os.path.join(SAVE_DIR, "best.pt")
+if os.path.exists(best_path):
+    ckpt = torch.load(best_path, map_location=device)
+    q.load_state_dict(ckpt['q'])
+    q_tgt.load_state_dict(ckpt['q_tgt'])
+    eps = ckpt.get('eps', eps)
+    step_count = ckpt.get('step_count', 0)
+    best_return = ckpt.get('best_return', best_return)
+    print(f"Loaded best model from {best_path} (eps={eps:.3f}, steps={step_count}, best_return={best_return:.1f})")
+else:
+    print("No saved model found, starting fresh")
 
 def save_checkpoint(name: str, is_best=False):
     path = os.path.join(SAVE_DIR, name)

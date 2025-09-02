@@ -5,30 +5,30 @@
 --   � ServerScriptService/RLServer.lua (from previous message)
 
 -- ========= CONFIG =========
-local STEP_DT       = 0.05            -- Internal control/update interval (reward shaping, local sim)
-local ACTION_DECISION_DT = 0.10       -- Faster decisions (still rate-limit friendly)
+local STEP_DT       = 0.08            -- Internal control/update interval (reward shaping, local sim)
+local ACTION_DECISION_DT = 0.25       -- increased to reduce HTTP rate limiting
 local CHECK_RADIUS  = 6               -- forgiving early on
 local FALL_Y        = -20
 local DOWN_RAY      = 50
 local FWD_RAY       = 50
 local VERBOSE       = true            -- master switch
-local LOG_EVERY     = 10              -- steps
+local LOG_EVERY     = 20              -- Increased from 10 to reduce log spam
 -- ==========================
 -- Progress shaping / anti-loop config
 local BACKTRACK_THRESH = 1.0          -- studs increase in distance considered a backtrack
 local BACKTRACK_PENALTY_SCALE = 0.05  -- penalty per stud of backtrack beyond threshold
-local STUCK_STEPS = 120               -- RL steps without sufficient improvement => stuck reset
+local STUCK_STEPS = 200               -- Increased to allow longer episodes
 local MIN_PROGRESS_EPS = 0.5          -- need at least this much dist improvement to count as progress
 local STUCK_PENALTY = 8               -- penalty when flagged stuck (separate from normal -10 death)
 local HEADING_SHAPE_SCALE = 0.002     -- reward scale for looking toward target (0 to disable)
-local HORIZ_PROGRESS_SCALE = 0.08     -- additional reward for horizontal (XZ) approach
-local JUMP_UP_BONUS = 0.5             -- bonus when upward velocity during approach & leaving ground
+local HORIZ_PROGRESS_SCALE = 0.15     -- Increased to reward horizontal progress more
+local JUMP_UP_BONUS = 1.0             -- bonus when upward velocity during approach & leaving ground
 local IDLE_SPEED_THRESH = 1.0         -- below this horizontal speed counts as idle
 local IDLE_PENALTY = 0.02             -- per step penalty while idle
 local MAX_TIME_SINCE_JUMP = 5.0       -- cap for observation normalization
 local BASE_WALK_SPEED = 16            -- baseline Humanoid WalkSpeed
-local FORWARD_JUMP_SPEED = 38         -- target horizontal speed when initiating a forward jump
-local JUMP_FORWARD_IMPULSE = 55       -- impulse strength for forward jump (scaled by mass)
+local FORWARD_JUMP_SPEED = 50         -- Increased for better platform jumps
+local JUMP_FORWARD_IMPULSE = 60       -- Increased impulse for forward jumps
 local FACE_TARGET_DURING_AIR = false  -- keep facing next checkpoint while airborne to reduce spin (set true to force)
 local AIR_STEER_KEEP_VEL = true       -- reserved flag for future in-air steering tweaks
 -- Hazard config
@@ -204,7 +204,7 @@ hum.AutoRotate = true  -- allow natural rotation toward Move() direction
 
 local function distanceToCP()
 	local pos = getCPPos(nextCP)
-	if not pos then return 0 end
+	if not pos or not hrp or not hrp.Position then return 0 end
 	return (pos - hrp.Position).Magnitude
 end
 
@@ -369,7 +369,13 @@ RunService.Heartbeat:Connect(function(dt)
 		milestoneBonus = 2
 		milestoneDist = dNow
 	end
-	local reward = -0.005 + 1.5 * shaped + leapBonus + milestoneBonus
+	local reward = -0.005 + 3.0 * shaped + leapBonus + milestoneBonus
+	-- Add sustained progress bonus
+	local sustainedBonus = 0
+	if improvement > 0.5 then
+		sustainedBonus = 0.5  -- Small bonus for consistent small improvements
+	end
+	reward = reward + sustainedBonus
 	lastPotential = -dNow
 	lastDist = dNow
 
@@ -392,7 +398,7 @@ RunService.Heartbeat:Connect(function(dt)
 
 	local reached = false
 	if atCheckpoint() then
-		reward += 10
+		reward += 20  -- Increased from 10 for stronger checkpoint incentive
 		log("Reached CP_%d (dist=%.2f)  +10", nextCP, dNow)
 		nextCP += 1
 		reached = true
@@ -410,11 +416,18 @@ RunService.Heartbeat:Connect(function(dt)
 		lastPotential = -lastDist
 		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d dt=%d", episodeCounter, STUCK_PENALTY, lastDist, nextCP, lastDeathType)
 	elseif done then
-		reward -= 10
+		-- Differentiate death penalties
+		if lastDeathType == 1 then
+			reward -= 15  -- harsher for hazards
+		elseif lastDeathType == 2 then
+			reward -= 8   -- milder for falls
+		else
+			reward -= 10  -- standard for other
+		end
 		episodeCounter += 1
 		lastDist = distanceToCP()
 		lastPotential = -lastDist
-		log("Episode %d reset  (-10). New dist=%.2f  nextCP=%d dt=%d", episodeCounter, lastDist, nextCP, lastDeathType)
+		log("Episode %d reset  (-%.1f). New dist=%.2f  nextCP=%d dt=%d", episodeCounter, -reward, lastDist, nextCP, lastDeathType)
 		bestDistThisCP = math.huge
 		noProgressSteps = 0
 	end
