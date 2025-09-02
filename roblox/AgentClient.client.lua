@@ -106,6 +106,18 @@ end
 -- Allow an optional CP_0 (acts as first learning target). If absent we start at CP_1.
 local HAS_CP0 = (CHECKPOINT_FOLDER:FindFirstChild("CP_0") ~= nil)
 local INITIAL_CP_INDEX = HAS_CP0 and 0 or 1
+-- Determine highest available checkpoint index so we can terminate/loop properly
+local MAX_CP_INDEX = (function()
+	local maxIdx = INITIAL_CP_INDEX
+	for _,child in ipairs(CHECKPOINT_FOLDER:GetChildren()) do
+		if child.Name:match("^CP_%d+$") then
+			local n = tonumber(child.Name:match("CP_(%d+)$"))
+			if n and n > maxIdx then maxIdx = n end
+		end
+	end
+	return maxIdx
+end)()
+log("Detected max checkpoint index = %d", MAX_CP_INDEX)
 local nextCP = INITIAL_CP_INDEX
 local lastDist = math.huge
 local lastPotential = 0            -- -lastDist after first distance measurement
@@ -398,13 +410,24 @@ RunService.Heartbeat:Connect(function(dt)
 
 	local reached = false
 	if atCheckpoint() then
-		reward += 20  -- Increased from 10 for stronger checkpoint incentive
-		log("Reached CP_%d (dist=%.2f)  +10", nextCP, dNow)
+		reward += 20  -- checkpoint incentive
+		log("Reached CP_%d (dist=%.2f)  +20", nextCP, dNow)
 		nextCP += 1
 		reached = true
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		bestDistThisCP = math.huge
 		noProgressSteps = 0
+		-- If we've surpassed the final checkpoint, treat as terminal episode success
+		if nextCP > MAX_CP_INDEX then
+			-- Large completion bonus scaled by number of checkpoints
+			local completionBonus = 50 + 10 * (MAX_CP_INDEX - INITIAL_CP_INDEX)
+			reward += completionBonus
+			log("All checkpoints cleared! bonus=%.1f restarting from beginning", completionBonus)
+			-- Reset loop
+			nextCP = INITIAL_CP_INDEX
+			-- Force an episode termination by simulating a soft reset (will mark done below)
+			forcedStuck = true  -- reuse existing termination path
+		end
 	end
 
 	local done = resetIfDeadOrFall()
@@ -480,6 +503,9 @@ RunService.Heartbeat:Connect(function(dt)
 			action = 1  -- fallback to forward move if jump attempted in air
 		end
 		currentAction = action
+		if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
+			log("Decision: action=%d (0=idle,1=fwd,2=left,3=right,4=jump,5=fwdjump,6=back)", currentAction)
+		end
 		if groundedNow and (action == 4 or action == 5) then
 			hum.Jump = true
 			if action == 5 then
